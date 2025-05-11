@@ -30,7 +30,7 @@ def get_conversation_history(session_id):
 def rephrase_query(user_query, history):
     prompt = f"Given the conversation history: {history}\nRephrase the user's question: {user_query}"
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-v2",  # Example model
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({"prompt": prompt, "max_tokens": 64}),
@@ -81,7 +81,7 @@ def build_augmented_prompt(history, context_chunks, user_query):
 # Helper: Invoke LLM (Bedrock)
 def invoke_llm(prompt):
     response = bedrock.invoke_model(
-        modelId="anthropic.claude-v2",
+        modelId="anthropic.claude-3-sonnet-20240229-v1:0",
         contentType="application/json",
         accept="application/json",
         body=json.dumps({"prompt": prompt, "max_tokens": 256}),
