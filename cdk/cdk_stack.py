@@ -11,11 +11,18 @@ from aws_cdk import (
     aws_elasticloadbalancingv2 as elbv2,
     SecretValue,
     CfnOutput,
+    RemovalPolicy,
+    aws_appsync as appsync,
+    aws_dynamodb as dynamodb,
+    aws_opensearchservice as opensearch,
+    aws_lambda as _lambda,
+    Duration,
 )
 from constructs import Construct
 from docker_app.config_file import Config
 
 CUSTOM_HEADER_NAME = "X-Custom-Header"
+
 
 class CdkStack(Stack):
 
@@ -29,24 +36,26 @@ class CdkStack(Stack):
         user_pool = cognito.UserPool(self, f"{prefix}UserPool")
 
         # Create Cognito client
-        user_pool_client = cognito.UserPoolClient(self, f"{prefix}UserPoolClient",
-                                                  user_pool=user_pool,
-                                                  generate_secret=True
-                                                  )
+        user_pool_client = cognito.UserPoolClient(
+            self, f"{prefix}UserPoolClient", user_pool=user_pool, generate_secret=True
+        )
 
         # Store Cognito parameters in a Secrets Manager secret
-        secret = secretsmanager.Secret(self, f"{prefix}ParamCognitoSecret",
-                                       secret_object_value={
-                                           "pool_id": SecretValue.unsafe_plain_text(user_pool.user_pool_id),
-                                           "app_client_id": SecretValue.unsafe_plain_text(user_pool_client.user_pool_client_id),
-                                           "app_client_secret": user_pool_client.user_pool_client_secret
-                                       },
-                                       # This secret name should be identical
-                                       # to the one defined in the Streamlit
-                                       # container
-                                       secret_name=Config.SECRETS_MANAGER_ID
-                                       )
-
+        secret = secretsmanager.Secret(
+            self,
+            f"{prefix}ParamCognitoSecret",
+            secret_object_value={
+                "pool_id": SecretValue.unsafe_plain_text(user_pool.user_pool_id),
+                "app_client_id": SecretValue.unsafe_plain_text(
+                    user_pool_client.user_pool_client_id
+                ),
+                "app_client_secret": user_pool_client.user_pool_client_secret,
+            },
+            # This secret name should be identical
+            # to the one defined in the Streamlit
+            # container
+            secret_name=Config.SECRETS_MANAGER_ID,
+        )
 
         # VPC for ALB and ECS cluster
         vpc = ec2.Vpc(
@@ -80,10 +89,8 @@ class CdkStack(Stack):
 
         # ECS cluster and service definition
         cluster = ecs.Cluster(
-            self,
-            f"{prefix}Cluster",
-            enable_fargate_capacity_providers=True,
-            vpc=vpc)
+            self, f"{prefix}Cluster", enable_fargate_capacity_providers=True, vpc=vpc
+        )
 
         # ALB to connect to ECS
         alb = elbv2.ApplicationLoadBalancer(
@@ -104,16 +111,15 @@ class CdkStack(Stack):
         )
 
         # Build Dockerfile from local folder and push to ECR
-        image = ecs.ContainerImage.from_asset('docker_app')
+        image = ecs.ContainerImage.from_asset("docker_app")
 
         fargate_task_definition.add_container(
             f"{prefix}WebContainer",
             # Use an image from DockerHub
             image=image,
             port_mappings=[
-                ecs.PortMapping(
-                    container_port=8501,
-                    protocol=ecs.Protocol.TCP)],
+                ecs.PortMapping(container_port=8501, protocol=ecs.Protocol.TCP)
+            ],
             logging=ecs.LogDrivers.aws_logs(stream_prefix="WebContainerLogs"),
         )
 
@@ -125,18 +131,18 @@ class CdkStack(Stack):
             service_name=f"{prefix}-stl-front",
             security_groups=[ecs_security_group],
             vpc_subnets=ec2.SubnetSelection(
-                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
+                subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
+            ),
         )
 
         # Grant access to Bedrock
-        bedrock_policy = iam.Policy(self, f"{prefix}BedrockPolicy",
-                                    statements=[
-                                        iam.PolicyStatement(
-                                            actions=["bedrock:InvokeModel"],
-                                            resources=["*"]
-                                        )
-                                    ]
-                                    )
+        bedrock_policy = iam.Policy(
+            self,
+            f"{prefix}BedrockPolicy",
+            statements=[
+                iam.PolicyStatement(actions=["bedrock:InvokeModel"], resources=["*"])
+            ],
+        )
         task_role = fargate_task_definition.task_role
         task_role.attach_inline_policy(bedrock_policy)
 
@@ -177,8 +183,9 @@ class CdkStack(Stack):
             priority=1,
             conditions=[
                 elbv2.ListenerCondition.http_header(
-                    CUSTOM_HEADER_NAME,
-                    [Config.CUSTOM_HEADER_VALUE])],
+                    CUSTOM_HEADER_NAME, [Config.CUSTOM_HEADER_VALUE]
+                )
+            ],
             protocol=elbv2.ApplicationProtocol.HTTP,
             targets=[service],
         )
@@ -194,8 +201,97 @@ class CdkStack(Stack):
         )
 
         # Output CloudFront URL
-        CfnOutput(self, "CloudFrontDistributionURL",
-                  value=cloudfront_distribution.domain_name)
+        CfnOutput(
+            self, "CloudFrontDistributionURL", value=cloudfront_distribution.domain_name
+        )
         # Output Cognito pool id
-        CfnOutput(self, "CognitoPoolId",
-                  value=user_pool.user_pool_id)
+        CfnOutput(self, "CognitoPoolId", value=user_pool.user_pool_id)
+
+        # DynamoDB Table
+        conversation_table = dynamodb.Table(
+            self,
+            "ConversationTable",
+            partition_key=dynamodb.Attribute(
+                name="sessionId", type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="timestamp", type=dynamodb.AttributeType.NUMBER
+            ),
+            billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # IAM Role for Lambda
+        lambda_role = iam.Role(
+            self,
+            "LambdaExecutionRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+        )
+
+        lambda_role.add_managed_policy(
+            iam.ManagedPolicy.from_aws_managed_policy_name(
+                "service-role/AWSLambdaBasicExecutionRole"
+            )
+        )
+
+        conversation_table.grant_read_write_data(lambda_role)
+
+        lambda_role.add_to_policy(
+            iam.PolicyStatement(actions=["bedrock:*"], resources=["*"])
+        )
+
+        lambda_role.add_to_policy(
+            iam.PolicyStatement(actions=["es:*"], resources=["*"])
+        )
+
+        # OpenSearch Domain
+        vector_search = opensearch.Domain(
+            self,
+            "VectorSearchDomain",
+            version=opensearch.EngineVersion.OPENSEARCH_2_11,
+            capacity=opensearch.CapacityConfig(
+                data_node_instance_type="t3.small.search",
+                multi_az_with_standby_enabled=False,
+            ),
+            ebs=opensearch.EbsOptions(volume_size=10),
+            removal_policy=RemovalPolicy.DESTROY,
+            access_policies=[
+                iam.PolicyStatement(
+                    actions=["es:*"], principals=[iam.AnyPrincipal()], resources=["*"]
+                )
+            ],
+        )
+
+        # Lambda Function
+        rag_lambda = _lambda.Function(
+            self,
+            "RAGLambdaFunction",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="lib.handler",
+            code=_lambda.Code.from_asset("docker_app"),
+            environment={
+                "TABLE_NAME": conversation_table.table_name,
+                "OPENSEARCH_ENDPOINT": vector_search.domain_endpoint,
+                "OPENSEARCH_INDEX_NAME": Config.OPENSEARCH_INDEX_NAME,
+            },
+            role=lambda_role,
+        )
+
+        # AppSync API
+        api = appsync.GraphqlApi(
+            self,
+            "RAGAppSyncAPI",
+            name="RAGAppSyncAPI",
+            schema=appsync.Schema.from_asset("graphql/schema.graphql"),
+            authorization_config=appsync.AuthorizationConfig(
+                default_authorization=appsync.AuthorizationMode(
+                    authorization_type=appsync.AuthorizationType.USER_POOL,
+                    user_pool_config=appsync.UserPoolConfig(user_pool=user_pool),
+                )
+            ),
+            xray_enabled=True,
+        )
+
+        lambda_ds = api.add_lambda_data_source("lambdaDatasource", rag_lambda)
+
+        lambda_ds.create_resolver(type_name="Query", field_name="askQuestion")
