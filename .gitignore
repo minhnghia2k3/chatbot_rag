@@ -12,3 +12,7 @@ cdk.out
 .env
 .idea
 .lambda_layer
+*.DS_Store
+
+# Lambda layer
+lambda_layer/python

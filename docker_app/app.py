@@ -12,7 +12,7 @@ HISTORY_FUNCTION_NAME = "GetHistoryLambda"
 
 # S3 client for uploads
 s3_client = boto3.client("s3", region_name=Config.DEPLOYMENT_REGION)
-PDF_BUCKET = os.environ["PDF_BUCKET"]
+PDF_BUCKET = "streamlit-streamlitknowledgebasebucketa9338ef5-feoy2u2ha782"
 
 # ID of Secrets Manager containing cognito parameters
 secrets_manager_id = Config.SECRETS_MANAGER_ID
