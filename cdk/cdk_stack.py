@@ -16,7 +16,8 @@ from aws_cdk import (
     aws_dynamodb as dynamodb,
     aws_opensearchservice as opensearch,
     aws_lambda as _lambda,
-    Duration,
+    aws_s3 as s3,
+    aws_lambda_event_sources as lambda_events,
 )
 from constructs import Construct
 from docker_app.config_file import Config
@@ -55,6 +56,14 @@ class CdkStack(Stack):
             # to the one defined in the Streamlit
             # container
             secret_name=Config.SECRETS_MANAGER_ID,
+        )
+
+        # S3 bucket for storing pdf files
+        pdf_bucket = s3.Bucket(
+            self,
+            f"{prefix}KnowledgeBaseBucket",
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
         )
 
         # VPC for ALB and ECS cluster
@@ -111,7 +120,9 @@ class CdkStack(Stack):
         )
 
         # Build Dockerfile from local folder and push to ECR
-        image = ecs.ContainerImage.from_asset("docker_app")
+        image = ecs.ContainerImage.from_registry(
+            "590183822512.dkr.ecr.us-east-1.amazonaws.com/cdk-hnb659fds-container-assets-590183822512-us-east-1"
+        )
 
         fargate_task_definition.add_container(
             f"{prefix}WebContainer",
@@ -121,6 +132,9 @@ class CdkStack(Stack):
                 ecs.PortMapping(container_port=8501, protocol=ecs.Protocol.TCP)
             ],
             logging=ecs.LogDrivers.aws_logs(stream_prefix="WebContainerLogs"),
+            environment={
+                "PDF_BUCKET": pdf_bucket.bucket_name,
+            },
         )
 
         service = ecs.FargateService(
@@ -207,6 +221,9 @@ class CdkStack(Stack):
         # Output Cognito pool id
         CfnOutput(self, "CognitoPoolId", value=user_pool.user_pool_id)
 
+        # Output bucketname
+        CfnOutput(self, "KnowledgeBaseBucketName", value=pdf_bucket.bucket_name)
+
         # DynamoDB Table
         conversation_table = dynamodb.Table(
             self,
@@ -257,7 +274,9 @@ class CdkStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
             access_policies=[
                 iam.PolicyStatement(
-                    actions=["es:*"], principals=[iam.AnyPrincipal()], resources=["*"]
+                    actions=["es:*"],
+                    principals=[iam.ArnPrincipal(lambda_role.role_arn)],
+                    resources=["*"],
                 )
             ],
         )
@@ -266,23 +285,32 @@ class CdkStack(Stack):
         rag_lambda = _lambda.Function(
             self,
             "RAGLambdaFunction",
+            function_name="RAGLambdaFunction",
             runtime=_lambda.Runtime.PYTHON_3_12,
-            handler="lib.handler",
-            code=_lambda.Code.from_asset("docker_app"),
+            handler="lib.lambda_handler",
+            code=_lambda.Code.from_asset("docker_app/lambda"),
             environment={
                 "TABLE_NAME": conversation_table.table_name,
-                "OPENSEARCH_ENDPOINT": vector_search.domain_endpoint,
+                "OPENSEARCH_HOST": vector_search.domain_endpoint,
                 "OPENSEARCH_INDEX_NAME": Config.OPENSEARCH_INDEX_NAME,
             },
             role=lambda_role,
         )
+
+        # Grant ECS task role permission to invoke the RAG Lambda
+        rag_lambda.grant_invoke(task_role)
+
+        # Grant ECS task role permission to read/write S3 object
+        pdf_bucket.grant_read_write(task_role)
 
         # AppSync API
         api = appsync.GraphqlApi(
             self,
             "RAGAppSyncAPI",
             name="RAGAppSyncAPI",
-            schema=appsync.Schema.from_asset("graphql/schema.graphql"),
+            definition=appsync.Definition.from_file(
+                "docker_app/graphql/schema.graphql"
+            ),
             authorization_config=appsync.AuthorizationConfig(
                 default_authorization=appsync.AuthorizationMode(
                     authorization_type=appsync.AuthorizationType.USER_POOL,
@@ -294,4 +322,63 @@ class CdkStack(Stack):
 
         lambda_ds = api.add_lambda_data_source("lambdaDatasource", rag_lambda)
 
-        lambda_ds.create_resolver(type_name="Query", field_name="askQuestion")
+        lambda_ds.create_resolver(
+            id="AskQuestionResolver",
+            type_name="Query",
+            field_name="askQuestion",
+        )
+
+        #  Define the ingest pdf Lambda
+        ingest_lambda = _lambda.Function(
+            self,
+            "IngestPdfLambda",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="ingest_pdf.lambda_handler",
+            code=_lambda.Code.from_asset("docker_app/lambda"),
+            environment={
+                "OPENSEARCH_HOST": vector_search.domain_endpoint,
+                "OPENSEARCH_INDEX": Config.OPENSEARCH_INDEX_NAME,
+                "BEDROCK_REGION": Config.BEDROCK_REGION,
+                "BUCKET_NAME": pdf_bucket.bucket_name,
+            },
+            role=lambda_role,
+        )
+
+        # Grant permissions
+        pdf_bucket.grant_read(ingest_lambda)
+
+        # Trigger Lambda on S3 upload
+        ingest_lambda.add_event_source(
+            lambda_events.S3EventSource(
+                pdf_bucket,
+                events=[s3.EventType.OBJECT_CREATED],
+                filters=[s3.NotificationKeyFilter(suffix=".pdf")],
+            )
+        )
+
+        # Define lambda function for fetch history
+        history_lambda = _lambda.Function(
+            self,
+            "GetHistoryLambda",
+            function_name="GetHistoryLambda",
+            runtime=_lambda.Runtime.PYTHON_3_12,
+            handler="get_history_lambda.lambda_handler",
+            code=_lambda.Code.from_asset("docker_app/lambda"),
+            environment={
+                "TABLE_NAME": conversation_table.table_name,
+            },
+            role=lambda_role,
+        )
+
+        # grand permission to task definition invoke history_lambda
+        history_lambda.grant_invoke(task_role)
+
+        opensearch_layer = _lambda.LayerVersion(
+            self,
+            "OpenSearchLayer",
+            code=_lambda.Code.from_asset("lambda_layer/opensearch_layer.zip"),
+            compatible_runtimes=[_lambda.Runtime.PYTHON_3_12],
+        )
+
+        ingest_lambda.add_layers(opensearch_layer)
+        rag_lambda.add_layers(opensearch_layer)
