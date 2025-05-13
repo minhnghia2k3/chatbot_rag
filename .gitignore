@@ -15,4 +15,4 @@ cdk.out
 *.DS_Store
 
 # Lambda layer
-lambda_layer/python
+lambda_layer/
